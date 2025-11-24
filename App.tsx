@@ -8,25 +8,17 @@ import PersonalitySelector from './components/PersonalitySelector';
 import { initializeChatSession, streamResponse } from './services/geminiService';
 import { THEMES, DEFAULT_GREETING, DEFAULT_SYSTEM_INSTRUCTION } from './constants';
 import { Message, Settings } from './types';
+import { getOrCreateUser, getAllMessages, addMessage, updateMessage, deleteAllMessages, subscribeToMessages, subscribeToMessageUpdates, DatabaseMessage } from './services/chatService';
 
 const App = () => {
   // State
   const [messages, setMessages] = useState<Message[]>([]);
   const [inputValue, setInputValue] = useState('');
   const [isTyping, setIsTyping] = useState(false);
-  const [settings, setSettings] = useState<Settings | null>(() => {
-    const saved = localStorage.getItem('gemini-chat-settings');
-    if (saved) {
-      const parsed = JSON.parse(saved);
-      // Backwards compatibility for settings saved before systemInstruction existed
-      if (!parsed.systemInstruction) {
-        parsed.systemInstruction = DEFAULT_SYSTEM_INSTRUCTION;
-      }
-      return parsed;
-    }
-    return null;
-  });
+  const [settings, setSettings] = useState<Settings | null>(null);
   const [tempUsername, setTempUsername] = useState('');
+  const [userId, setUserId] = useState<string | null>(null);
+  const [isLoadingMessages, setIsLoadingMessages] = useState(true);
   
   // Menu Visibility States
   const [isThemeMenuOpen, setIsThemeMenuOpen] = useState(false);
@@ -39,31 +31,34 @@ const App = () => {
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const chatContainerRef = useRef<HTMLDivElement>(null);
 
-  // Secret URL Check
   useEffect(() => {
     if (window.location.pathname === '/clear_chat') {
-      localStorage.removeItem('gemini-chat-history');
       window.history.replaceState(null, '', '/');
-      setMessages([]);
+      deleteAllMessages().catch(console.error);
     }
   }, []);
 
-  // Load messages from localStorage on initial load
   useEffect(() => {
-    const savedMessages = localStorage.getItem('gemini-chat-history');
-    if (savedMessages) {
-      setMessages(JSON.parse(savedMessages));
-    } else {
-      const initialMsg: Message = {
-        id: 'init-1',
-        text: DEFAULT_GREETING,
-        sender: 'ai',
-        timestamp: Date.now(),
-        username: 'Gemini'
-      };
-      setMessages([initialMsg]);
-      localStorage.setItem('gemini-chat-history', JSON.stringify([initialMsg]));
-    }
+    const loadMessages = async () => {
+      try {
+        const dbMessages = await getAllMessages();
+        const convertedMessages: Message[] = dbMessages.map(msg => ({
+          id: msg.id,
+          text: msg.text,
+          sender: msg.sender,
+          timestamp: msg.timestamp,
+          username: msg.username,
+          isStreaming: msg.is_streaming
+        }));
+        setMessages(convertedMessages);
+      } catch (error) {
+        console.error('Failed to load messages:', error);
+      } finally {
+        setIsLoadingMessages(false);
+      }
+    };
+
+    loadMessages();
   }, []);
 
   // Re-initialize chat session when API key or System Instruction changes
@@ -73,24 +68,45 @@ const App = () => {
     }
   }, [settings?.apiKey, settings?.systemInstruction]);
 
-  // Listen for storage changes to sync across tabs
   useEffect(() => {
-    const handleStorageChange = (e: StorageEvent) => {
-      if (e.key === 'gemini-chat-history' && e.newValue) {
-        const newMessages = JSON.parse(e.newValue);
-        setMessages(newMessages);
+    if (!settings) return;
+
+    const unsubscribe = subscribeToMessages((newMessage) => {
+      setMessages(prev => {
+        const exists = prev.some(msg => msg.id === newMessage.id);
+        if (exists) return prev;
+        return [...prev, {
+          id: newMessage.id,
+          text: newMessage.text,
+          sender: newMessage.sender,
+          timestamp: newMessage.timestamp,
+          username: newMessage.username,
+          isStreaming: newMessage.is_streaming
+        }];
+      });
+    });
+
+    return () => unsubscribe();
+  }, [settings]);
+
+  useEffect(() => {
+    if (!settings || !userId) return;
+
+    const updateSettings = async () => {
+      try {
+        await updateMessage('', {
+          api_key: settings.apiKey,
+          system_instruction: settings.systemInstruction,
+          theme: settings.theme
+        } as any);
+      } catch (error) {
+        console.error('Failed to update settings:', error);
       }
     };
-    window.addEventListener('storage', handleStorageChange);
-    return () => window.removeEventListener('storage', handleStorageChange);
-  }, []);
 
-  // Auto-save settings
-  useEffect(() => {
-    if (settings) {
-      localStorage.setItem('gemini-chat-settings', JSON.stringify(settings));
-    }
-  }, [settings]);
+    const debounceTimer = setTimeout(updateSettings, 1000);
+    return () => clearTimeout(debounceTimer);
+  }, [settings, userId]);
 
   // Auto-scroll
   useEffect(() => {
@@ -100,62 +116,78 @@ const App = () => {
   const activeTheme = settings && THEMES[settings.theme] ? THEMES[settings.theme] : THEMES.emerald;
   const textColor = activeTheme.textColor || 'text-gray-800';
 
-  const updateMessagesInStorage = (newMsg: Message) => {
-     const current = JSON.parse(localStorage.getItem('gemini-chat-history') || '[]');
-     const next = [...current, newMsg];
-     setMessages(next);
-     localStorage.setItem('gemini-chat-history', JSON.stringify(next));
+  const addMessageToChat = async (newMsg: Omit<Message, 'id'>) => {
+    try {
+      const dbMsg = await addMessage({
+        ...newMsg,
+        userId: newMsg.sender === 'user' ? userId : undefined
+      });
+      setMessages(prev => [...prev, {
+        id: dbMsg.id,
+        text: dbMsg.text,
+        sender: dbMsg.sender,
+        timestamp: dbMsg.timestamp,
+        username: dbMsg.username,
+        isStreaming: dbMsg.is_streaming
+      }]);
+    } catch (error) {
+      console.error('Failed to add message:', error);
+    }
   };
 
-  const handleLogin = (e: React.FormEvent) => {
+  const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!tempUsername.trim()) return;
-    
-    const newSettings: Settings = {
-      username: tempUsername.trim(),
-      theme: 'emerald',
-      apiKey: settings?.apiKey || '',
-      systemInstruction: DEFAULT_SYSTEM_INSTRUCTION
-    };
-    
-    setSettings(newSettings);
-    
-    const joinMsg: Message = {
-       id: Date.now().toString(),
-       text: `${newSettings.username} joined the chat`,
-       sender: 'system',
-       timestamp: Date.now(),
-       username: 'System'
-    };
-    updateMessagesInStorage(joinMsg);
-  };
 
-  const handleLogout = () => {
-    if (settings) {
-       const leaveMsg: Message = {
-         id: Date.now().toString(),
-         text: `${settings.username} left the chat`,
-         sender: 'system',
-         timestamp: Date.now(),
-         username: 'System'
+    try {
+      const user = await getOrCreateUser(tempUsername.trim());
+      setUserId(user.id);
+
+      const newSettings: Settings = {
+        username: user.username,
+        theme: user.theme,
+        apiKey: user.api_key || '',
+        systemInstruction: user.system_instruction
       };
-      updateMessagesInStorage(leaveMsg);
-    }
-    setSettings(null);
-    setTempUsername('');
-  };
 
-  const clearHistory = () => {
-    if (window.confirm('Are you sure you want to delete all messages for everyone?')) {
-      const resetMsg: Message = {
-        id: Date.now().toString(),
-        text: "History cleared.",
+      setSettings(newSettings);
+
+      const joinMsg: Omit<Message, 'id'> = {
+        text: `${newSettings.username} joined the chat`,
         sender: 'system',
         timestamp: Date.now(),
         username: 'System'
       };
-      setMessages([resetMsg]);
-      localStorage.setItem('gemini-chat-history', JSON.stringify([resetMsg]));
+      await addMessageToChat(joinMsg);
+    } catch (error) {
+      console.error('Failed to login:', error);
+      alert('Failed to join chat. Please try again.');
+    }
+  };
+
+  const handleLogout = async () => {
+    if (settings) {
+      const leaveMsg: Omit<Message, 'id'> = {
+        text: `${settings.username} left the chat`,
+        sender: 'system',
+        timestamp: Date.now(),
+        username: 'System'
+      };
+      await addMessageToChat(leaveMsg);
+    }
+    setSettings(null);
+    setUserId(null);
+    setTempUsername('');
+  };
+
+  const clearHistory = async () => {
+    if (window.confirm('Are you sure you want to delete all messages for everyone?')) {
+      try {
+        await deleteAllMessages();
+        setMessages([]);
+      } catch (error) {
+        console.error('Failed to clear history:', error);
+      }
     }
   };
 
@@ -165,36 +197,33 @@ const App = () => {
     }
   };
 
-  const saveApiKey = (newApiKey: string) => {
+  const saveApiKey = async (newApiKey: string) => {
     const oldApiKey = settings?.apiKey;
     if (settings) {
-        setSettings(prev => prev ? ({ ...prev, apiKey: newApiKey }) : null);
-        
-        if (oldApiKey !== newApiKey && settings.username) {
-            const apiKeyChangeMsg: Message = {
-                id: Date.now().toString(),
-                text: `${settings.username} updated the API key.`,
-                sender: 'system',
-                timestamp: Date.now(),
-                username: 'System'
-            };
-            updateMessagesInStorage(apiKeyChangeMsg);
-        }
+      setSettings(prev => prev ? ({ ...prev, apiKey: newApiKey }) : null);
+
+      if (oldApiKey !== newApiKey && settings.username) {
+        const apiKeyChangeMsg: Omit<Message, 'id'> = {
+          text: `${settings.username} updated the API key.`,
+          sender: 'system',
+          timestamp: Date.now(),
+          username: 'System'
+        };
+        await addMessageToChat(apiKeyChangeMsg);
+      }
     }
   };
 
-  const updateSystemInstruction = (newInstruction: string) => {
+  const updateSystemInstruction = async (newInstruction: string) => {
     if (settings) {
       setSettings({ ...settings, systemInstruction: newInstruction });
-      // Announce the change
-      const sysChangeMsg: Message = {
-        id: Date.now().toString(),
+      const sysChangeMsg: Omit<Message, 'id'> = {
         text: `${settings.username} changed the AI personality.`,
         sender: 'system',
         timestamp: Date.now(),
         username: 'System'
       };
-      updateMessagesInStorage(sysChangeMsg);
+      await addMessageToChat(sysChangeMsg);
     }
   };
 
@@ -215,81 +244,72 @@ const App = () => {
 
     const userText = inputValue.trim();
     setInputValue('');
-    
-    // 1. Create User Message
-    const userMsg: Message = {
-      id: Date.now().toString(),
+
+    const userMsg: Omit<Message, 'id'> = {
       text: userText,
       sender: 'user',
       timestamp: Date.now(),
       username: settings.username
     };
 
-    updateMessagesInStorage(userMsg);
+    await addMessageToChat(userMsg);
 
-    // 2. Check for Gemini Trigger
     if (userText.toLowerCase().startsWith('!gemini')) {
-      const prompt = userText.substring(7).trim(); 
-      if (!prompt) { 
-          setIsTyping(false);
-          setTimeout(() => inputRef.current?.focus(), 100);
-          return;
+      const prompt = userText.substring(7).trim();
+      if (!prompt) {
+        setIsTyping(false);
+        setTimeout(() => inputRef.current?.focus(), 100);
+        return;
       }
 
       if (!settings.apiKey) {
-          const noApiKeyMsg: Message = {
-              id: (Date.now() + 0.5).toString(),
-              text: `Error: Gemini API Key is missing. Please set it via the Key icon in the header.`,
-              sender: 'system',
-              timestamp: Date.now(),
-              username: 'System'
-          };
-          updateMessagesInStorage(noApiKeyMsg);
-          setIsTyping(false);
-          return;
+        const noApiKeyMsg: Omit<Message, 'id'> = {
+          text: `Error: Gemini API Key is missing. Please set it via the Key icon in the header.`,
+          sender: 'system',
+          timestamp: Date.now(),
+          username: 'System'
+        };
+        await addMessageToChat(noApiKeyMsg);
+        setIsTyping(false);
+        return;
       }
 
       setIsTyping(true);
 
-      const aiMsgId = (Date.now() + 1).toString();
-      const initialAiMsg: Message = {
-        id: aiMsgId,
+      const initialAiMsg: Omit<Message, 'id'> = {
         text: '',
         sender: 'ai',
         timestamp: Date.now(),
         username: 'Gemini',
         isStreaming: true
       };
-      
-      setMessages(prev => { 
-          const next = [...prev, initialAiMsg];
-          localStorage.setItem('gemini-chat-history', JSON.stringify(next));
-          return next;
-      });
 
       try {
+        const dbMsg = await addMessage({
+          ...initialAiMsg,
+          userId: undefined
+        });
+        const aiMsgId = dbMsg.id;
+
         let fullResponse = "";
         const stream = streamResponse(prompt, settings.apiKey, settings.systemInstruction);
 
         for await (const chunk of stream) {
           fullResponse += chunk;
-          setMessages(prev => {
-            const updated = prev.map(msg => 
+          await updateMessage(aiMsgId, { text: fullResponse } as any);
+          setMessages(prev =>
+            prev.map(msg =>
               msg.id === aiMsgId ? { ...msg, text: fullResponse } : msg
-            );
-            localStorage.setItem('gemini-chat-history', JSON.stringify(updated));
-            return updated;
-          });
-        }
-        
-        setMessages(prev => {
-          const updated = prev.map(msg => 
-            msg.id === aiMsgId ? { ...msg, isStreaming: false } : msg
+            )
           );
-          localStorage.setItem('gemini-chat-history', JSON.stringify(updated));
-          return updated;
-        });
+        }
 
+        await updateMessage(aiMsgId, { is_streaming: false } as any);
+        setMessages(prev =>
+          prev.map(msg =>
+            msg.id === aiMsgId ? { ...msg, isStreaming: false } : msg
+          )
+        );
       } catch (err) {
         console.error(err);
       } finally {
@@ -297,7 +317,7 @@ const App = () => {
         setTimeout(() => inputRef.current?.focus(), 100);
       }
     } else {
-       setTimeout(() => inputRef.current?.focus(), 100);
+      setTimeout(() => inputRef.current?.focus(), 100);
     }
   };
 
@@ -487,7 +507,7 @@ const App = () => {
           
           <div className="text-center mt-2 flex justify-center items-center gap-2">
              <p className="text-[10px] text-gray-400">
-               Shift+Enter for new line • Local Chat Sync Enabled
+               Shift+Enter for new line • Real-time Sync Enabled
              </p>
           </div>
         </div>
