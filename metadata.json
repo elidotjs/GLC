@@ -1,0 +1,5 @@
+{
+  "name": "Gemini Live Chat",
+  "description": "A real-time customizable chat application with persistent history, multiple themes, and AI-powered conversations using Google Gemini.",
+  "requestFramePermissions": []
+}
